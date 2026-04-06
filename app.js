@@ -519,6 +519,122 @@ app.delete('/api/threats/:id', async (req, res) => {
   }
 });
 
+// General email analysis endpoint - called by frontend
+app.post('/api/analyze', async (req, res) => {
+  const { sender, subject, content, links } = req.body;
+
+  if (!sender || !subject || !content) {
+    return res.status(400).json({ error: 'Missing required fields: sender, subject, content' });
+  }
+
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'Gemini API key not configured' });
+    }
+
+    // Build analysis prompt
+    const prompt = `You are a cybersecurity expert specializing in phishing and spam detection. Analyze the following email and determine if it's a phishing attempt OR spam/marketing email.
+
+Email Details:
+- Sender: ${sender}
+- Subject: ${subject}
+- Content: ${content.substring(0, 8000)}
+- Links (${(links || []).length} total): ${(links || []).slice(0, 20).join(', ')}
+
+Analyze for PHISHING:
+1. Suspicious sender addresses (spoofing, typos, unusual domains)
+2. Urgent or threatening language
+3. Requests for personal information
+4. Suspicious links (mismatched domains, URL shorteners, typosquatting)
+5. Grammar and spelling errors
+6. Generic greetings
+7. Unusual attachments or requests
+
+Analyze for SPAM/MARKETING - Mark isSpam=true MORE AGGRESSIVELY:
+STRONG SPAM INDICATORS (mark isSpam=true if ANY of these apply):
+1. Email from known bulk mailer services: Robly, Mailchimp, Klaviyo, Constant Contact, SendGrid, ActiveCampaign, Brevo, GetResponse, ConvertKit, etc.
+2. MISSING unsubscribe link/mechanism - MAJOR red flag for unsolicited marketing
+3. Sender spoofing generic news/brand names (e.g., "news@robly.com", "alert@marketing-service.com")
+4. Multiple recipient indicators (BCC patterns, "Dear Subscriber", "Dear Customer")
+5. Obvious mass mailing: repeated templates, batch characteristics, low personalization
+6. Deceptive domain masquerading (crime-news domain actually hosted on mail service)
+7. Misleading subject lines with urgency/clickbait (fake news angle, false urgency)
+8. Suspicious marketing: crypto, get-rich-quick, fake jobs, MLM, pharmacy
+9. No legitimate business identifier or clear sender authorization
+
+LEGITIMATE NEWSLETTER EXCEPTION (mark isSpam=false):
+- Official domains from known publications (CNN, BBC, Reuters, etc.)
+- Legitimate company newsletters with proper branding and verification
+- Subscription services user explicitly requested
+- Clear unsubscribe present + proper sender identification
+
+CRITICAL: Respond ONLY with valid JSON. No text before or after. No markdown. Just pure JSON.
+
+Required JSON format:
+{
+  "riskLevel": "SAFE",
+  "confidence": 85,
+  "isSpam": false,
+  "indicators": ["indicator1", "indicator2"],
+  "recommendation": "recommendation text",
+  "explanation": "explanation text"
+}
+
+riskLevel must be exactly: SAFE, SUSPICIOUS, or DANGER (classification for phishing/threats)
+confidence must be a number 0-100 (confidence in riskLevel assessment)
+isSpam must be true or false (true for deceptive/unsolicited marketing, false for legitimate newsletters)
+indicators must be an array of at most 5 SHORT strings, each under 8 words
+recommendation must be a single short sentence (max 20 words)
+explanation must be a single short sentence (max 20 words)`;
+
+    // Call Gemini API with standard analysis config
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + apiKey, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 1024,
+          responseMimeType: 'application/json'
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error('Gemini API error:', error);
+      return res.status(500).json({ error: 'Gemini API failed: ' + (error.error?.message || response.status) });
+    }
+
+    // Parse Gemini response
+    const data = await response.json();
+    let analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    
+    // Clean up JSON if needed
+    analysisText = analysisText.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
+    const analysis = JSON.parse(jsonMatch ? jsonMatch[0] : analysisText);
+
+    // Validate response
+    if (!analysis.riskLevel || analysis.confidence === undefined) {
+      return res.status(500).json({ error: 'Invalid Gemini response format' });
+    }
+
+    // Ensure isSpam is set
+    if (analysis.isSpam === undefined) {
+      analysis.isSpam = false;
+    }
+
+    console.log('✅ Email analysis completed:', { riskLevel: analysis.riskLevel, isSpam: analysis.isSpam, confidence: analysis.confidence });
+    res.json(analysis);
+  } catch (error) {
+    console.error('Email analysis error:', error);
+    res.status(500).json({ error: 'Failed to analyze email: ' + error.message });
+  }
+});
+
 // Aggressive reanalysis endpoint
 app.post('/api/reanalyze', async (req, res) => {
   const userEmail = req.userEmail || req.headers['x-user-email'] || req.body?.userEmail;
