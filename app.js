@@ -352,7 +352,7 @@ app.get('/api/threats', async (req, res) => {
 
     const connection = await pool.getConnection();
     
-    const limitNum = Math.max(1, Math.min(parseInt(limit) || 50, 500)); // Clamp between 1-500
+    const limitNum = Math.max(1, Math.min(parseInt(limit) || 50, 1000)); // Clamp between 1-1000
     const offsetNum = Math.max(0, parseInt(offset) || 0);
     
     // LIMIT and OFFSET must be literals in MySQL prepared statements, not parameter placeholders
@@ -374,30 +374,30 @@ app.get('/api/threats', async (req, res) => {
     
     console.log('Executing query for user:', userEmail, 'limit:', limitNum, 'offset:', offsetNum);
     const [rows] = await connection.execute(query, [userEmail]);
+    console.log('Query returned', rows.length, 'rows');
+    if (rows.length > 0) {
+      console.log('First row sample:', JSON.stringify(rows[0], null, 2));
+    }
 
     connection.release();
 
     // Parse JSON fields
     const threats = rows.map((row) => {
       try {
-        const analysisDetails = row.analysis_details ? JSON.parse(row.analysis_details) : {};
-        // Classify as spam: emails with marketing/promotional indicators or safe emails with low threat score
-        const hasSpamIndicators = analysisDetails.indicators?.some((ind) => 
-          ind.toLowerCase().includes('marketing') || 
-          ind.toLowerCase().includes('promotional') ||
-          ind.toLowerCase().includes('legitimate sender') ||
-          ind.toLowerCase().includes('bulk') ||
-          ind.toLowerCase().includes('newsletter') ||
-          ind.toLowerCase().includes('notification')
-        );
-        
-        const isSpam = hasSpamIndicators || 
-          (row.threat_level === 'safe' && row.threat_score < 30);
+        // Handle both string and already-parsed objects from database
+        const analysisDetails = row.analysis_details 
+          ? (typeof row.analysis_details === 'string' ? JSON.parse(row.analysis_details) : row.analysis_details)
+          : {};
+        // Classify as spam: ONLY if AI explicitly flagged it via analysis_details.isSpam
+        // Do NOT use heuristics - be precise
+        const isSpam = analysisDetails.isSpam === true;
         
         return {
           ...row,
           isSpam,
-          reasons: row.reasons ? JSON.parse(row.reasons) : [],
+          reasons: row.reasons 
+            ? (typeof row.reasons === 'string' ? JSON.parse(row.reasons) : row.reasons)
+            : [],
           analysis_details: analysisDetails
         };
       } catch (parseError) {
@@ -476,8 +476,8 @@ app.get('/api/threats/:identifier', async (req, res) => {
 
     const threat = {
       ...rows[0],
-      reasons: JSON.parse(rows[0].reasons || '[]'),
-      analysis_details: JSON.parse(rows[0].analysis_details || '{}')
+      reasons: typeof rows[0].reasons === 'string' ? JSON.parse(rows[0].reasons) : (rows[0].reasons || []),
+      analysis_details: typeof rows[0].analysis_details === 'string' ? JSON.parse(rows[0].analysis_details) : (rows[0].analysis_details || {})
     };
 
     res.json(threat);
@@ -516,6 +516,245 @@ app.delete('/api/threats/:id', async (req, res) => {
   } catch (error) {
     console.error('Error deleting threat:', error);
     res.status(500).json({ error: 'Failed to delete threat' });
+  }
+});
+
+// Aggressive reanalysis endpoint
+app.post('/api/reanalyze', async (req, res) => {
+  const userEmail = req.userEmail || req.headers['x-user-email'] || req.body?.userEmail;
+  const { gmailEmailId, sender, subject, content, mode } = req.body;
+
+  if (!userEmail || !gmailEmailId || !mode) {
+    return res.status(400).json({ error: 'Missing required fields: userEmail, gmailEmailId, mode' });
+  }
+
+  if (!pool) {
+    return res.status(503).json({ error: 'Database not available' });
+  }
+
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'Gemini API key not configured' });
+    }
+
+
+
+    // Helper to build prompt with variable content length
+    function buildPrompt(contentLen) {
+      const safeContent = content ? content.substring(0, contentLen) : '';
+      if (mode === 'spam') {
+        return `AGGRESSIVE SPAM DETECTION: You are an EMAIL SPAM CLASSIFIER with ZERO TOLERANCE for marketing.
+
+Email Details:
+From: ${sender}
+Subject: ${subject}
+Content: ${safeContent}
+
+MARK AS SPAM (isSpam=true) IF ANY of these apply:
+1. Any connection to bulk mailer services (Robly, Mailchimp, SendGrid, Klaviyo, etc.)
+2. Missing OR hidden unsubscribe link
+3. Generic/"noreply"/"no-reply" sender addresses
+4. Mass mailing characteristics or batch send patterns
+5. Any marketing-oriented language
+6. Link redirects to unknown/suspicious domains
+7. Suspicious domain patterns or sender spoofing
+8. News/alert masquerading (fake news sources)
+9. Generic greetings ("Dear Subscriber", "Dear Customer")
+10. When in doubt about legitimacy, mark as spam
+
+Respond ONLY with valid JSON:
+{ "isSpam": true, "confidence": 95, "reason": "reason text" }
+or
+{ "isSpam": false, "confidence": 85, "reason": "reason text" }`;
+      } else if (mode === 'phishing') {
+        return `AGGRESSIVE PHISHING/SCAM DETECTION: You are a PHISHING/SCAM CLASSIFIER with ZERO TOLERANCE for suspicious activity.
+
+Email Details:
+From: ${sender}
+Subject: ${subject}
+Content: ${safeContent}
+
+MARK AS DANGEROUS (isDanger=true) IF ANY of these apply:
+1. Urgent/threatening language demanding immediate action
+2. Suspicious sender or domain typosquatting attempts
+3. Links that don't match the stated sender domain
+4. Requests for credentials, passwords, or authentication
+5. Requests for payment, bank details, or financial information
+6. Impersonation of known services/companies/brands
+7. Spoofed headers or suspicious routing
+8. Obfuscated or shortened URLs hiding destination
+9. Financial/account threat language ("verify account", "confirm identity")
+10. Suspicious attachments or unusual requests
+11. When in doubt about legitimacy, mark as dangerous
+
+Respond ONLY with valid JSON:
+{ "isDanger": true, "confidence": 95, "reason": "reason text" }
+or
+{ "isDanger": false, "confidence": 85, "reason": "reason text" }`;
+      } else {
+        return null;
+      }
+    }
+
+    // Try with default content length, then retry with smaller if MAX_TOKENS
+    let contentLens = [600, 200, 80];
+    let lastData = null;
+    let lastRawText = null;
+    let lastResponse = null;
+    let analysisText = null;
+    let finishReason = null;
+    
+    // Phishing prompt is longer, needs more output tokens
+    const maxTokens = mode === 'phishing' ? 2048 : 1024;
+    
+    for (let i = 0; i < contentLens.length; i++) {
+      const aggressivePrompt = buildPrompt(contentLens[i]);
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: aggressivePrompt }] }],
+          generationConfig: {
+            temperature: 0.7,
+            maxOutputTokens: maxTokens,
+            responseMimeType: "application/json"
+          }
+        })
+      });
+      lastResponse = response;
+      lastRawText = await response.text();
+      let data;
+      try {
+        data = JSON.parse(lastRawText);
+      } catch (e) {
+        console.error('Gemini API raw response:', lastRawText);
+        throw new Error(`Failed to parse Gemini API response: ${e.message}`);
+      }
+      lastData = data;
+      if (!response.ok) {
+        const error = data.error || data;
+        console.error('Gemini API error response:', data);
+        throw new Error(`Gemini API error: ${error.message || error.error?.message || response.status}`);
+      }
+      // Check structure
+      if (!data.candidates || !data.candidates[0] || !data.candidates[0].content || !data.candidates[0].content.parts || !data.candidates[0].content.parts[0]) {
+        console.error('Unexpected Gemini API response structure:', JSON.stringify(data));
+        return res.status(502).json({
+          error: 'Gemini API returned unexpected response structure',
+          details: data
+        });
+      }
+      analysisText = data.candidates[0].content.parts[0].text;
+      finishReason = data.candidates[0].finishReason;
+      // If analysisText is valid and finishReason is not MAX_TOKENS, break
+      if (analysisText && analysisText.trim() !== '' && analysisText.trim() !== '{' && analysisText.trim().endsWith('}') && finishReason !== 'MAX_TOKENS') {
+        break;
+      }
+      // If last attempt, break anyway
+      if (i === contentLens.length - 1) {
+        break;
+      }
+    }
+
+    if (!analysisText || analysisText.trim() === '' || analysisText.trim() === '{' || !analysisText.trim().endsWith('}')) {
+      console.error('Gemini API analysisText is empty or incomplete after retries. Full Gemini response:', JSON.stringify(lastData));
+      return res.status(500).json({
+        error: 'Gemini API returned empty or incomplete analysis text after retries',
+        details: lastData
+      });
+    }
+
+    let analysis;
+    try {
+      analysis = JSON.parse(analysisText);
+    } catch (e) {
+      console.error('Gemini API analysisText not valid JSON:', analysisText);
+      console.error('Full Gemini response:', JSON.stringify(data));
+      return res.status(502).json({
+        error: 'Gemini API analysisText not valid JSON',
+        analysisText,
+        details: data
+      });
+    }
+
+    // Determine new threat level based on aggressive analysis
+    let newThreatLevel = 'safe';
+    let newThreatScore = 10;
+    let analysisDetails = { isSpam: false };
+
+    if (mode === 'spam') {
+      // If aggressive spam detection flags it, mark as spam
+      analysisDetails.isSpam = analysis.isSpam === true;
+      if (analysis.isSpam) {
+        newThreatLevel = 'safe'; // Spam is categorized separately
+        newThreatScore = 25; // Moderate score for spam
+      }
+    } else if (mode === 'phishing') {
+      // If aggressive phishing detection flags it, mark as danger
+      if (analysis.isDanger === true) {
+        newThreatLevel = 'danger';
+        newThreatScore = 95;
+      }
+    }
+
+    // Update database with reanalysis results
+    const connection = await pool.getConnection();
+    
+    try {
+      // Find existing record by gmail_email_id
+      const [existingRows] = await connection.execute(
+        'SELECT id FROM EmailThreats WHERE gmail_email_id = ? AND user_email = ?',
+        [gmailEmailId, userEmail]
+      );
+
+      if (existingRows.length > 0) {
+        // Update existing record
+        const existingId = existingRows[0].id;
+        const analysisDetailsJson = JSON.stringify(analysisDetails);
+        const reasonsJson = JSON.stringify([analysis.reason]);
+
+        await connection.execute(
+          `UPDATE EmailThreats 
+           SET threat_level = ?, threat_score = ?, analysis_details = ?, reasons = ?, scanned_at = NOW()
+           WHERE id = ? AND user_email = ?`,
+          [newThreatLevel, newThreatScore, analysisDetailsJson, reasonsJson, existingId, userEmail]
+        );
+
+        console.log(`✅ Reanalysis saved for email ${gmailEmailId}: ${mode} mode`);
+      } else {
+        console.warn(`⚠️  Email record not found in database for ${gmailEmailId}, creating new record`);
+        
+        // Insert new record if not found
+        const analysisDetailsJson = JSON.stringify(analysisDetails);
+        const reasonsJson = JSON.stringify([analysis.reason]);
+        
+        await connection.execute(
+          `INSERT INTO EmailThreats (user_email, gmail_email_id, from_address, subject, threat_level, threat_score, analysis_details, reasons, scanned_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [userEmail, gmailEmailId, sender, subject, newThreatLevel, newThreatScore, analysisDetailsJson, reasonsJson]
+        );
+      }
+    } finally {
+      connection.release();
+    }
+
+    res.json({
+      success: true,
+      mode,
+      reanalysisResult: {
+        isSpam: analysis.isSpam,
+        isDanger: analysis.isDanger,
+        confidence: analysis.confidence,
+        reason: analysis.reason
+      },
+      newThreatLevel,
+      newThreatScore,
+      message: 'Reanalysis completed and database updated'
+    });
+  } catch (error) {
+    console.error('Reanalysis error:', error);
+    res.status(500).json({ error: `Reanalysis failed: ${error.message}` });
   }
 });
 
