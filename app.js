@@ -596,7 +596,7 @@ explanation must be a single short sentence (max 20 words)`;
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 1024,
+          maxOutputTokens: 2048,
           responseMimeType: 'application/json'
         }
       })
@@ -721,8 +721,8 @@ or
     let analysisText = null;
     let finishReason = null;
     
-    // Phishing prompt is longer, needs more output tokens
-    const maxTokens = mode === 'phishing' ? 2048 : 1024;
+    // Both modes need sufficient tokens - aggressive analysis produces longer responses
+    const maxTokens = mode === 'phishing' ? 2048 : 2048;
     
     for (let i = 0; i < contentLens.length; i++) {
       const aggressivePrompt = buildPrompt(contentLens[i]);
@@ -765,18 +765,25 @@ or
       finishReason = data.candidates[0].finishReason;
       // If analysisText is valid and finishReason is not MAX_TOKENS, break
       if (analysisText && analysisText.trim() !== '' && analysisText.trim() !== '{' && analysisText.trim().endsWith('}') && finishReason !== 'MAX_TOKENS') {
+        console.log(`✅ Complete response received on attempt ${i + 1}`);
         break;
       }
-      // If last attempt, break anyway
+      // If we hit token limit, log and continue to next retry
+      if (finishReason === 'MAX_TOKENS') {
+        console.log(`⚠️  Token limit hit on attempt ${i + 1}, retrying with shorter content...`);
+      }
+      // If last attempt, break anyway (even if incomplete)
       if (i === contentLens.length - 1) {
+        console.log(`⚠️  Final attempt (${i + 1}/${contentLens.length}) - response: ${analysisText.substring(0, 100)}...`);
         break;
       }
     }
 
-    if (!analysisText || analysisText.trim() === '' || analysisText.trim() === '{' || !analysisText.trim().endsWith('}')) {
-      console.error('Gemini API analysisText is empty or incomplete after retries. Full Gemini response:', JSON.stringify(lastData));
+    // More lenient validation - try to work with partial responses
+    if (!analysisText || analysisText.trim() === '' || analysisText.trim() === '{') {
+      console.error('Gemini API analysisText is completely empty after retries. Full Gemini response:', JSON.stringify(lastData));
       return res.status(500).json({
-        error: 'Gemini API returned empty or incomplete analysis text after retries',
+        error: 'Gemini API returned empty analysis text after retries',
         details: lastData
       });
     }
@@ -785,16 +792,42 @@ or
     try {
       analysis = JSON.parse(analysisText);
     } catch (e) {
-      console.error('Gemini API analysisText not valid JSON:', analysisText);
-      console.error('Full Gemini response:', JSON.stringify(data));
-      return res.status(502).json({
-        error: 'Gemini API analysisText not valid JSON',
-        analysisText,
-        details: data
-      });
+      // If JSON parsing fails, try to extract partial JSON
+      console.warn('⚠️  Incomplete JSON detected, attempting to extract:', analysisText.substring(0, 150));
+      
+      // Try to find and close the JSON object if incomplete
+      const closingBrace = analysisText.lastIndexOf('}');
+      if (closingBrace > 0) {
+        const truncated = analysisText.substring(0, closingBrace + 1);
+        try {
+          analysis = JSON.parse(truncated);
+          console.log('✅ Successfully parsed truncated JSON:', JSON.stringify(analysis));
+        } catch (e2) {
+          console.error('Failed to parse even truncated JSON:', truncated.substring(0, 150));
+          return res.status(502).json({
+            error: 'Gemini API returned incomplete/invalid JSON',
+            analysisText: analysisText.substring(0, 200),
+            details: lastData
+          });
+        }
+      } else {
+        console.error('No closing brace found in response. Full response:', analysisText);
+        return res.status(502).json({
+          error: 'Gemini API response has no closing brace',
+          analysisText: analysisText.substring(0, 200),
+          details: lastData
+        });
+      }
     }
 
-    // Determine new threat level based on aggressive analysis
+    // Validate we got minimum required fields (even if response was incomplete)
+    if (!analysis || typeof analysis !== 'object') {
+      return res.status(502).json({
+        error: 'Gemini API parse result is not an object',
+        analysisText: analysisText.substring(0, 200),
+        details: lastData
+      });
+    }
     let newThreatLevel = 'safe';
     let newThreatScore = 10;
     let analysisDetails = { isSpam: false };
