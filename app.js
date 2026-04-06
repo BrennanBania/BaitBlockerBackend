@@ -828,22 +828,44 @@ or
         details: lastData
       });
     }
+    
+    // IMPORTANT: Trust Gemini's analysis completely - user report is just a suggestion to re-check with aggressive rules
     let newThreatLevel = 'safe';
     let newThreatScore = 10;
     let analysisDetails = { isSpam: false };
+    let geminiDecision = null;
 
     if (mode === 'spam') {
-      // If aggressive spam detection flags it, mark as spam
+      // User suggested this might be SPAM - run aggressive spam detection
+      // BUT: Only mark as spam if Gemini's analysis confirms it
+      // If Gemini says it's NOT spam, it stays SAFE (trust Gemini)
       analysisDetails.isSpam = analysis.isSpam === true;
-      if (analysis.isSpam) {
-        newThreatLevel = 'safe'; // Spam is categorized separately
-        newThreatScore = 25; // Moderate score for spam
+      
+      if (analysis.isSpam === true) {
+        geminiDecision = 'SPAM_CONFIRMED';
+        newThreatLevel = 'safe'; 
+        newThreatScore = 25;
+        console.log(`✅ ${mode} mode: Gemini confirmed SPAM (confidence: ${analysis.confidence})`);
+      } else {
+        geminiDecision = 'SPAM_REJECTED_AS_SAFE';
+        newThreatLevel = 'safe';
+        newThreatScore = 10;
+        console.log(`✅ ${mode} mode: Gemini says NOT SPAM - keeping as SAFE (confidence: ${analysis.confidence})`);
       }
     } else if (mode === 'phishing') {
-      // If aggressive phishing detection flags it, mark as danger
+      // User suggested this might be SCAM/PHISHING - run aggressive phishing detection
+      // BUT: Only mark as danger if Gemini's analysis confirms it
+      // If Gemini says it's NOT dangerous, it stays SAFE (trust Gemini)
       if (analysis.isDanger === true) {
+        geminiDecision = 'PHISHING_CONFIRMED';
         newThreatLevel = 'danger';
         newThreatScore = 95;
+        console.log(`⚠️  ${mode} mode: Gemini confirmed PHISHING/SCAM (confidence: ${analysis.confidence})`);
+      } else {
+        geminiDecision = 'PHISHING_REJECTED_AS_SAFE';
+        newThreatLevel = 'safe';
+        newThreatScore = 10;
+        console.log(`✅ ${mode} mode: Gemini says NOT PHISHING - keeping as SAFE (confidence: ${analysis.confidence})`);
       }
     }
 
@@ -891,15 +913,18 @@ or
     res.json({
       success: true,
       mode,
+      userReported: mode, // What the user suggested to re-check
+      geminiDecision, // What Gemini actually found (the source of truth)
       reanalysisResult: {
-        isSpam: analysis.isSpam,
-        isDanger: analysis.isDanger,
+        geminiSaysSpam: analysis.isSpam,
+        geminiSaysDangerous: analysis.isDanger,
         confidence: analysis.confidence,
         reason: analysis.reason
       },
+      // Final classification (what we trust)
       newThreatLevel,
       newThreatScore,
-      message: 'Reanalysis completed and database updated'
+      message: `Reanalysis completed. Gemini ${geminiDecision === 'SPAM_CONFIRMED' || geminiDecision === 'PHISHING_CONFIRMED' ? 'confirmed' : 'rejected'} the ${mode} suggestion. Classification updated.`
     });
   } catch (error) {
     console.error('Reanalysis error:', error);
