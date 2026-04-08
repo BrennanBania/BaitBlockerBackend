@@ -475,7 +475,7 @@ app.get('/api/threats/:identifier', async (req, res) => {
     if (/^\d+$/.test(identifier)) {
       // Numeric ID - search by database ID
       query = `
-        SELECT id, user_email, gmail_email_id, from_address, subject, threat_level, threat_score, reasons, analysis_details, scanned_at, created_at
+        SELECT id, user_email, gmail_email_id, from_address, subject, threat_level, threat_score, reasons, analysis_details, scanned_at, created_at, isSeen
         FROM EmailThreats
         WHERE id = ? AND user_email = ?
       `;
@@ -483,7 +483,7 @@ app.get('/api/threats/:identifier', async (req, res) => {
     } else {
       // Gmail email ID - search by gmail_email_id
       query = `
-        SELECT id, user_email, gmail_email_id, from_address, subject, threat_level, threat_score, reasons, analysis_details, scanned_at, created_at
+        SELECT id, user_email, gmail_email_id, from_address, subject, threat_level, threat_score, reasons, analysis_details, scanned_at, created_at, isSeen
         FROM EmailThreats
         WHERE gmail_email_id = ? AND user_email = ?
         ORDER BY created_at DESC
@@ -1049,15 +1049,15 @@ or
 });
 
 // Mark email as safe (update threat_level to 'safe')
-app.put('/api/threats/:id/mark-safe', async (req, res) => {
-  const { id } = req.params;
+app.put('/api/threats/:identifier/mark-safe', async (req, res) => {
+  const { identifier } = req.params;
   const userEmail = req.userEmail || req.headers['x-user-email'] || req.body?.userEmail;
 
   if (!userEmail) {
     return res.status(401).json({ error: 'User email required. Send via x-user-email header or userEmail in body' });
   }
 
-  if (!id) {
+  if (!identifier) {
     return res.status(400).json({ error: 'Email ID required' });
   }
 
@@ -1068,14 +1068,29 @@ app.put('/api/threats/:id/mark-safe', async (req, res) => {
 
     const connection = await pool.getConnection();
     
-    const query = `
-      UPDATE EmailThreats 
-      SET threat_level = 'safe', threat_score = 10, analysis_details = ?
-      WHERE id = ? AND user_email = ?
-    `;
+    // identifier can be either database id (numeric) or gmail_email_id (string)
+    let query;
+    let params;
     
-    const analysisDetails = JSON.stringify({ userMarkedSafe: true });
-    const [result] = await connection.execute(query, [analysisDetails, id, userEmail]);
+    if (/^\d+$/.test(identifier)) {
+      // Numeric - database ID
+      query = `
+        UPDATE EmailThreats 
+        SET threat_level = 'safe', threat_score = 10, analysis_details = ?
+        WHERE id = ? AND user_email = ?
+      `;
+      params = [JSON.stringify({ userMarkedSafe: true }), identifier, userEmail];
+    } else {
+      // String - Gmail email ID
+      query = `
+        UPDATE EmailThreats 
+        SET threat_level = 'safe', threat_score = 10, analysis_details = ?
+        WHERE gmail_email_id = ? AND user_email = ?
+      `;
+      params = [JSON.stringify({ userMarkedSafe: true }), identifier, userEmail];
+    }
+    
+    const [result] = await connection.execute(query, params);
     
     connection.release();
 
@@ -1096,15 +1111,15 @@ app.put('/api/threats/:id/mark-safe', async (req, res) => {
 });
 
 // Mark email as reviewed (set isSeen to true)
-app.put('/api/threats/:id/mark-seen', async (req, res) => {
-  const { id } = req.params;
+app.put('/api/threats/:identifier/mark-seen', async (req, res) => {
+  const { identifier } = req.params;
   const userEmail = req.userEmail || req.headers['x-user-email'] || req.body?.userEmail;
 
   if (!userEmail) {
     return res.status(401).json({ error: 'User email required. Send via x-user-email header or userEmail in body' });
   }
 
-  if (!id) {
+  if (!identifier) {
     return res.status(400).json({ error: 'Email ID required' });
   }
 
@@ -1116,14 +1131,29 @@ app.put('/api/threats/:id/mark-seen', async (req, res) => {
 
     connection = await pool.getConnection();
     
-    // First, try to update the record
-    const query = `
-      UPDATE EmailThreats 
-      SET isSeen = true
-      WHERE id = ? AND user_email = ?
-    `;
+    // identifier can be either database id (numeric) or gmail_email_id (string)
+    let query;
+    let params;
     
-    const [result] = await connection.execute(query, [id, userEmail]);
+    if (/^\d+$/.test(identifier)) {
+      // Numeric - database ID
+      query = `
+        UPDATE EmailThreats 
+        SET isSeen = true
+        WHERE id = ? AND user_email = ?
+      `;
+      params = [identifier, userEmail];
+    } else {
+      // String - Gmail email ID
+      query = `
+        UPDATE EmailThreats 
+        SET isSeen = true
+        WHERE gmail_email_id = ? AND user_email = ?
+      `;
+      params = [identifier, userEmail];
+    }
+    
+    const [result] = await connection.execute(query, params);
 
     if (result.affectedRows === 0) {
       connection.release();
@@ -1156,13 +1186,26 @@ app.put('/api/threats/:id/mark-seen', async (req, res) => {
         console.log('✅ isSeen column created successfully');
         
         // Now update the record
-        const updateQuery = `
-          UPDATE EmailThreats 
-          SET isSeen = true
-          WHERE id = ? AND user_email = ?
-        `;
+        let updateQuery;
+        let updateParams;
         
-        const [updateResult] = await connection.execute(updateQuery, [id, userEmail]);
+        if (/^\d+$/.test(identifier)) {
+          updateQuery = `
+            UPDATE EmailThreats 
+            SET isSeen = true
+            WHERE id = ? AND user_email = ?
+          `;
+          updateParams = [identifier, userEmail];
+        } else {
+          updateQuery = `
+            UPDATE EmailThreats 
+            SET isSeen = true
+            WHERE gmail_email_id = ? AND user_email = ?
+          `;
+          updateParams = [identifier, userEmail];
+        }
+        
+        const [updateResult] = await connection.execute(updateQuery, updateParams);
         connection.release();
 
         if (updateResult.affectedRows === 0) {
