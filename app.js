@@ -5,6 +5,58 @@ const mysql = require('mysql2/promise');
 
 const app = express();
 
+// ── Error Classification Utility ───────────────────────────────────────────
+// Classify errors and add appropriate prefixes for frontend error detection
+const classifyError = (error) => {
+  const message = error.message || String(error);
+  
+  // Timeout errors
+  if (message.includes('PROTOCOL_SEQUENCE_TIMEOUT') || 
+      message.includes('ETIMEDOUT') || 
+      message.includes('ECONNRESET') ||
+      message.includes('timeout')) {
+    return { prefix: 'TIMEOUT', status: 504 };
+  }
+  
+  // Authentication/Session expiration errors
+  if (message.includes('ER_ACCESS_DENIED') || 
+      message.includes('401') ||
+      message.includes('Unauthorized') ||
+      message.includes('Invalid token')) {
+    return { prefix: 'EXPIRED', status: 401 };
+  }
+  
+  // Connection errors
+  if (message.includes('ECONNREFUSED') || 
+      message.includes('EHOSTUNREACH') ||
+      message.includes('connect') ||
+      message.includes('PROTOCOL_CONNECTION_LOST')) {
+    return { prefix: 'CONNECTION', status: 503 };
+  }
+  
+  // Database errors
+  if (message.includes('ER_NO_SUCH_TABLE') ||
+      message.includes('ER_UNKNOWN_COLUMN')) {
+    return { prefix: 'DATABASE', status: 500 };
+  }
+  
+  // Default
+  return { prefix: 'ERROR', status: 500 };
+};
+
+// Format error response with classification prefix
+const formatErrorResponse = (error, context = '') => {
+  const classification = classifyError(error);
+  const message = error.message || String(error);
+  
+  return {
+    error: `${classification.prefix}: ${message}`,
+    context: context || undefined,
+    code: error.code || error.errno || undefined,
+    status: classification.status
+  };
+};
+
 // Middleware - Configure CORS to allow Chrome extension requests
 app.use(cors({
   origin: true, // Allow all origins including chrome-extension://
@@ -123,10 +175,12 @@ const initializeDatabase = async () => {
   } catch (error) {
     console.error('❌ Database initialization failed:', error.message);
     console.error('Error code:', error.code);
-    if (error.message.includes('ER_ACCESS_DENIED')) {
+    const errorResponse = formatErrorResponse(error, 'Database initialization');
+    if (errorResponse.error.includes('TIMEOUT')) {
+      console.error('🕐 Database connection timeout - check DB_HOST responsiveness');
+    } else if (errorResponse.error.includes('EXPIRED')) {
       console.error('🔐 Authentication failed - check DB_USER and DB_PASSWORD');
-    }
-    if (error.message.includes('ECONNREFUSED') || error.message.includes('EHOSTUNREACH')) {
+    } else if (errorResponse.error.includes('CONNECTION')) {
       console.error('🌐 Cannot reach database server - check DB_HOST and network');
     }
     throw error;  // Re-throw to fail the startup
@@ -167,9 +221,11 @@ app.get('/api/debug/schema', async (req, res) => {
     });
   } catch (error) {
     console.error('Schema check error:', error.message);
-    res.status(500).json({ 
-      error: 'Failed to check schema',
-      details: error.message
+    const errorResponse = formatErrorResponse(error, 'Schema check failed');
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context,
+      code: errorResponse.code
     });
   }
 });
@@ -205,7 +261,11 @@ app.get('/api/stats', async (req, res) => {
     res.json(rows[0]);
   } catch (error) {
     console.error('Error fetching stats:', error);
-    res.status(500).json({ error: 'Failed to fetch stats' });
+    const errorResponse = formatErrorResponse(error, 'Stats fetch failed');
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context
+    });
   }
 });
 
@@ -246,17 +306,11 @@ app.post('/api/threats', async (req, res) => {
         console.log('✅ Emergency initialization successful');
       } catch (initError) {
         console.error('❌ Emergency initialization failed:', initError.message);
-        return res.status(503).json({ 
-          error: 'Database not available', 
-          details: 'Pool not initialized and emergency init failed',
-          dbStatus: {
-            poolExists: false,
-            env: {
-              DB_HOST: process.env.DB_HOST ? 'SET' : 'NOT SET',
-              DB_USER: process.env.DB_USER ? 'SET' : 'NOT SET',
-              DB_PASSWORD: process.env.DB_PASSWORD ? 'SET' : 'NOT SET'
-            }
-          }
+        const errorResponse = formatErrorResponse(initError, 'Emergency database initialization');
+        return res.status(errorResponse.status).json({ 
+          error: errorResponse.error,
+          context: 'Database pool not available during POST /api/threats',
+          code: errorResponse.code
         });
       }
     }
@@ -293,42 +347,14 @@ app.post('/api/threats', async (req, res) => {
   } catch (error) {
     console.error('❌ Error saving threat:', error.message);
     console.error('Full error:', error);
-    console.error('Error code:', error.code);
-    console.error('Error errno:', error.errno);
-    console.error('Stack:', error.stack);
     
-    // Return specific error messages for debugging
-    let statusCode = 500;
-    let errorMsg = 'Failed to save threat analysis';
-    let errorDetails = {
-      message: error.message,
-      code: error.code,
-      errno: error.errno
-    };
+    const classification = classifyError(error);
+    const errorResponse = formatErrorResponse(error, 'Error saving threat analysis');
     
-    if (error.message.includes('PROTOCOL_CONNECTION_LOST')) {
-      errorMsg = 'Database connection lost - will retry';
-      statusCode = 503;
-    } else if (error.message.includes('ER_ACCESS_DENIED')) {
-      errorMsg = 'Database authentication failed';
-      statusCode = 401;
-    } else if (error.message.includes('ER_NO_SUCH_TABLE')) {
-      errorMsg = 'Database table not found - initializing';
-      statusCode = 503;
-    } else if (error.message.includes('ECONNREFUSED') || error.message.includes('connect')) {
-      errorMsg = 'Cannot connect to database server';
-      statusCode = 503;
-      errorDetails.suggestion = 'Check DB_HOST and network connectivity';
-    } else if (error.message.includes('PROTOCOL_SEQUENCE_TIMEOUT')) {
-      errorMsg = 'Database query timeout';
-      statusCode = 504;
-    }
-    
-    res.status(statusCode).json({ 
-      error: errorMsg, 
-      details: error.message,
-      errorCode: error.code,
-      fullDetails: process.env.NODE_ENV === 'development' ? errorDetails : undefined
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context,
+      code: errorResponse.code
     });
   }
 });
@@ -414,12 +440,11 @@ app.get('/api/threats', async (req, res) => {
     res.json({ threats, count: threats.length });
   } catch (error) {
     console.error('Error fetching threats:', error.message);
-    console.error('Error code:', error.code);
-    console.error('Stack:', error.stack);
-    res.status(500).json({ 
-      error: 'Failed to fetch threats', 
-      details: error.message,
-      code: error.code
+    const errorResponse = formatErrorResponse(error, 'Threats fetch failed');
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context,
+      code: errorResponse.code
     });
   }
 });
@@ -483,7 +508,11 @@ app.get('/api/threats/:identifier', async (req, res) => {
     res.json(threat);
   } catch (error) {
     console.error('Error fetching threat:', error);
-    res.status(500).json({ error: 'Failed to fetch threat' });
+    const errorResponse = formatErrorResponse(error, 'Threat fetch failed');
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context
+    });
   }
 });
 
@@ -515,7 +544,11 @@ app.delete('/api/threats/:id', async (req, res) => {
     res.json({ message: 'Threat deleted successfully' });
   } catch (error) {
     console.error('Error deleting threat:', error);
-    res.status(500).json({ error: 'Failed to delete threat' });
+    const errorResponse = formatErrorResponse(error, 'Threat deletion failed');
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context
+    });
   }
 });
 
@@ -534,7 +567,22 @@ app.post('/api/analyze', async (req, res) => {
     }
 
     // Build analysis prompt
-    const prompt = `You are a cybersecurity expert specializing in phishing and spam detection. Analyze the following email and determine if it's a phishing attempt OR spam/marketing email.
+    const prompt = `You are a cybersecurity expert specializing in email threat detection. Analyze the following email and classify it on TWO INDEPENDENT dimensions:
+
+1. THREAT LEVEL (riskLevel): How dangerous is this email?
+   - DANGER: Active phishing, scam, fraud, credential theft, malware
+   - SUSPICIOUS: Suspicious characteristics but not confirmed threat
+   - SAFE: Legitimate email with no harmful intent
+
+2. SPAM TYPE (isSpam): Is this unsolicited marketing/bulk mail?
+   - true: Deceptive marketing, bulk mailer, unsolicited advertisement
+   - false: Legitimate business email, transactional, or requested communication
+
+CRITICAL: These are INDEPENDENT classifications. An email can be:
+- DANGER + isSpam=true (scam pretending to be legitimate service)
+- DANGER + isSpam=false (targeted phishing attack)
+- SAFE + isSpam=true (legitimate newsletter you didn't subscribe to)
+- SAFE + isSpam=false (legitimate email)
 
 Email Details:
 - Sender: ${sender}
@@ -542,32 +590,39 @@ Email Details:
 - Content: ${content.substring(0, 8000)}
 - Links (${(links || []).length} total): ${(links || []).slice(0, 20).join(', ')}
 
-Analyze for PHISHING:
-1. Suspicious sender addresses (spoofing, typos, unusual domains)
-2. Urgent or threatening language
-3. Requests for personal information
-4. Suspicious links (mismatched domains, URL shorteners, typosquatting)
-5. Grammar and spelling errors
-6. Generic greetings
-7. Unusual attachments or requests
+THREAT DETECTION (riskLevel):
+Mark DANGER if:
+1. Phishing/credential theft (fake login pages, urgent action required, account verification)
+2. Financial fraud (money transfer requests, banking scams, wire transfer)
+3. Impersonation (spoofed sender, fake brand, typosquatting domains)
+4. Malware/Attachment threats (suspicious downloads, macro-enabled files)
+5. Social engineering/Scams (get-rich-quick, prize claims, romance scams, tech support scams)
+6. Business Email Compromise indicators
 
-Analyze for SPAM/MARKETING - Mark isSpam=true MORE AGGRESSIVELY:
-STRONG SPAM INDICATORS (mark isSpam=true if ANY of these apply):
-1. Email from known bulk mailer services: Robly, Mailchimp, Klaviyo, Constant Contact, SendGrid, ActiveCampaign, Brevo, GetResponse, ConvertKit, etc.
-2. MISSING unsubscribe link/mechanism - MAJOR red flag for unsolicited marketing
-3. Sender spoofing generic news/brand names (e.g., "news@robly.com", "alert@marketing-service.com")
-4. Multiple recipient indicators (BCC patterns, "Dear Subscriber", "Dear Customer")
-5. Obvious mass mailing: repeated templates, batch characteristics, low personalization
-6. Deceptive domain masquerading (crime-news domain actually hosted on mail service)
-7. Misleading subject lines with urgency/clickbait (fake news angle, false urgency)
-8. Suspicious marketing: crypto, get-rich-quick, fake jobs, MLM, pharmacy
-9. No legitimate business identifier or clear sender authorization
+Mark SUSPICIOUS if:
+1. Some phishing characteristics but not definitive
+2. Unusual sender + unusual request combination
+3. Suspicious links but otherwise legitimate-looking
+4. Premium service offers without clear legitimacy
 
-LEGITIMATE NEWSLETTER EXCEPTION (mark isSpam=false):
-- Official domains from known publications (CNN, BBC, Reuters, etc.)
-- Legitimate company newsletters with proper branding and verification
-- Subscription services user explicitly requested
-- Clear unsubscribe present + proper sender identification
+Mark SAFE if:
+1. Email from authenticated domain you recognize
+2. Clear business purpose with no suspicious elements
+3. Legitimate transactional email (receipt, confirmation, alert)
+4. No requests for sensitive information or action
+
+SPAM CLASSIFICATION (isSpam):
+Mark isSpam=true ONLY for unsolicited bulk marketing:
+1. Email from bulk mailer services (Mailchimp, SendGrid, Klaviyo, etc.)
+2. Missing unsubscribe or hard to unsubscribe
+3. Generic bulk template characteristics
+4. Deceptive subject line (fake urgency, clickbait not matching content)
+
+Mark isSpam=false for:
+1. Legitimate newsletters you can verify
+2. Transactional emails (receipts, confirmations)
+3. Business communications (support, alerts)
+4. Even if it's risky, if it's targeted/legitimate-looking
 
 CRITICAL: Respond ONLY with valid JSON. No text before or after. No markdown. Just pure JSON.
 
@@ -581,12 +636,12 @@ Required JSON format:
   "explanation": "explanation text"
 }
 
-riskLevel must be exactly: SAFE, SUSPICIOUS, or DANGER (classification for phishing/threats)
-confidence must be a number 0-100 (confidence in riskLevel assessment)
-isSpam must be true or false (true for deceptive/unsolicited marketing, false for legitimate newsletters)
-indicators must be an array of at most 5 SHORT strings, each under 8 words
-recommendation must be a single short sentence (max 20 words)
-explanation must be a single short sentence (max 20 words)`;
+riskLevel must be exactly: SAFE, SUSPICIOUS, or DANGER
+confidence must be 0-100 for riskLevel assessment
+isSpam must be true or false for marketing classification
+indicators: list up to 5 key findings, max 8 words each
+recommendation: single sentence max 20 words for user action
+explanation: single sentence max 20 words why this classification`;
 
     // Call Gemini API with standard analysis config
     const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + apiKey, {
@@ -603,9 +658,9 @@ explanation must be a single short sentence (max 20 words)`;
     });
 
     if (!response.ok) {
-      const error = await response.json();
-      console.error('Gemini API error:', error);
-      return res.status(500).json({ error: 'Gemini API failed: ' + (error.error?.message || response.status) });
+      const errorText = await response.text();
+      console.error('Gemini API error:', errorText);
+      return res.status(500).json({ error: 'Gemini API failed: ' + errorText });
     }
 
     // Parse Gemini response
@@ -614,12 +669,28 @@ explanation must be a single short sentence (max 20 words)`;
     
     // Clean up JSON if needed
     analysisText = analysisText.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-    const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
-    const analysis = JSON.parse(jsonMatch ? jsonMatch[0] : analysisText);
+    
+    let analysis;
+    try {
+      const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
+      analysis = JSON.parse(jsonMatch ? jsonMatch[0] : analysisText);
+    } catch (parseError) {
+      console.error('Failed to parse Gemini response:', analysisText);
+      // Fallback to safe response if parsing fails
+      analysis = {
+        riskLevel: 'SAFE',
+        confidence: 50,
+        isSpam: false,
+        indicators: ['Unable to fully analyze'],
+        recommendation: 'Could not fully analyze this email',
+        explanation: 'Analysis service encountered difficulty with this email'
+      };
+    }
 
     // Validate response
     if (!analysis.riskLevel || analysis.confidence === undefined) {
-      return res.status(500).json({ error: 'Invalid Gemini response format' });
+      analysis.riskLevel = 'SAFE';
+      analysis.confidence = 50;
     }
 
     // Ensure isSpam is set
@@ -631,7 +702,18 @@ explanation must be a single short sentence (max 20 words)`;
     res.json(analysis);
   } catch (error) {
     console.error('Email analysis error:', error);
-    res.status(500).json({ error: 'Failed to analyze email: ' + error.message });
+    const errorResponse = formatErrorResponse(error, 'Email analysis failed');
+    
+    // For analysis endpoint, return safe default on error instead of 5xx
+    // This prevents the extension from breaking on transient failures
+    res.json({
+      riskLevel: 'SAFE',
+      confidence: 30,
+      isSpam: false,
+      indicators: [errorResponse.error],
+      recommendation: 'Contact support if issues persist',
+      explanation: 'Email analysis service encountered an issue'
+    });
   }
 });
 
@@ -660,49 +742,61 @@ app.post('/api/reanalyze', async (req, res) => {
     function buildPrompt(contentLen) {
       const safeContent = content ? content.substring(0, contentLen) : '';
       if (mode === 'spam') {
-        return `AGGRESSIVE SPAM DETECTION: You are an EMAIL SPAM CLASSIFIER with ZERO TOLERANCE for marketing.
+        return `EMAIL SPAM CLASSIFICATION: You are an EMAIL SPAM DETECTOR. Focus on ACTUAL SPAM characteristics, not legitimate marketing.
 
 Email Details:
 From: ${sender}
 Subject: ${subject}
 Content: ${safeContent}
 
-MARK AS SPAM (isSpam=true) IF ANY of these apply:
-1. Any connection to bulk mailer services (Robly, Mailchimp, SendGrid, Klaviyo, etc.)
-2. Missing OR hidden unsubscribe link
-3. Generic/"noreply"/"no-reply" sender addresses
-4. Mass mailing characteristics or batch send patterns
-5. Any marketing-oriented language
-6. Link redirects to unknown/suspicious domains
-7. Suspicious domain patterns or sender spoofing
-8. News/alert masquerading (fake news sources)
-9. Generic greetings ("Dear Subscriber", "Dear Customer")
-10. When in doubt about legitimacy, mark as spam
+MARK AS SPAM (isSpam=true) ONLY IF MULTIPLE of these apply:
+1. Obvious bulk mailer service HEADERS or unsubscribe links pointing to mass mailer platforms (Mailchimp, SendGrid, Klaviyo unsubscribe pages - NOT including legitimate service notifications)
+2. COMPLETELY missing unsubscribe link (legitimate services always include one)
+3. Generic BATCH SENDER patterns ("noreply@" + unfamiliar domain with multiple recipients - NOT single service notifications)
+4. IDENTICAL template structure repeated across multiple emails (only identifiable if pattern provided)
+5. SUSPICIOUS URGENCY combined with requests for personal data or payment
+6. Clear indicators of mass marketing campaigns with deceptive practices
+7. OBVIOUS phishing-style links redirecting to suspicious domains
+8. SPOOFED sender address impersonating known companies with mismatched domains
+9. Unsolicited bulk advertisements with hidden or fake sender identity
+
+DO NOT mark as spam if:
+- Email is from a legitimate service the recipient subscribed to (Rocket Money, PayPal, bank alerts, etc.)
+- Email contains standard marketing language but has legitimate unsubscribe link
+- Email is a transactional notification (receipt, confirmation, alert)
+- Email is from a recognizable company with proper sender authentication
+- Email appears to be legitimate service communication
 
 Respond ONLY with valid JSON:
 { "isSpam": true, "confidence": 95, "reason": "reason text" }
 or
 { "isSpam": false, "confidence": 85, "reason": "reason text" }`;
       } else if (mode === 'phishing') {
-        return `AGGRESSIVE PHISHING/SCAM DETECTION: You are a PHISHING/SCAM CLASSIFIER with ZERO TOLERANCE for suspicious activity.
+        return `EMAIL PHISHING/SCAM CLASSIFICATION: You are a PHISHING/SCAM DETECTOR specialized in identifying fraudulent emails. Focus on ACTUAL security threats, not legitimate urgent communications.
 
 Email Details:
 From: ${sender}
 Subject: ${subject}
 Content: ${safeContent}
 
-MARK AS DANGEROUS (isDanger=true) IF ANY of these apply:
-1. Urgent/threatening language demanding immediate action
-2. Suspicious sender or domain typosquatting attempts
-3. Links that don't match the stated sender domain
-4. Requests for credentials, passwords, or authentication
-5. Requests for payment, bank details, or financial information
-6. Impersonation of known services/companies/brands
-7. Spoofed headers or suspicious routing
-8. Obfuscated or shortened URLs hiding destination
-9. Financial/account threat language ("verify account", "confirm identity")
-10. Suspicious attachments or unusual requests
-11. When in doubt about legitimacy, mark as dangerous
+MARK AS DANGEROUS (isDanger=true) ONLY IF MULTIPLE of these apply:
+1. Sender domain is SPOOFED or impersonates a known company (e.g., "paypa1.com" instead of "paypal.com") - verify domain authenticity
+2. Unsolicited requests for sensitive information: passwords, credit card numbers, authentication codes, SSN, PINs
+3. Urgent/threatening language combined with action requests ("Verify account NOW or access will be LOCKED")
+4. Links that redirect to DIFFERENT domains than stated in email (e.g., "Update PayPal" linked to "secure-paypa1-verify.xyz")
+5. Social engineering tactics using fake urgency, account threats, or prize claims
+6. Malicious attachments or suspicious download requests with deceptive names
+7. Requests for payment to "unlock" accounts, claim prizes, or resolve problems
+8. Multiple phishing indicators (spoofed sender + credential request + urgent language)
+9. Known phishing patterns or obfuscated URLs hiding malicious destinations
+
+DO NOT mark as dangerous if:
+- Email is from a legitimate service the recipient uses (legitimate password resets, account alerts, etc.)
+- Email is a standard security notification with proper sender authentication
+- Email contains legitimate urgent language (outages, billing issues) but from verified company domain
+- Email is asking users to contact support through official channels (not via suspicious links)
+- Email appears to be a legitimate transactional notification or legitimate service communication
+- Sender domain can be verified as legitimate through proper DNS/DKIM checks
 
 Respond ONLY with valid JSON:
 { "isDanger": true, "confidence": 95, "reason": "reason text" }
@@ -842,10 +936,18 @@ or
       analysisDetails.isSpam = analysis.isSpam === true;
       
       if (analysis.isSpam === true) {
-        geminiDecision = 'SPAM_CONFIRMED';
-        newThreatLevel = 'safe'; 
-        newThreatScore = 25;
-        console.log(`✅ ${mode} mode: Gemini confirmed SPAM (confidence: ${analysis.confidence})`);
+        // Require minimum 75% confidence to mark as spam
+        if ((analysis.confidence || 0) >= 75) {
+          geminiDecision = 'SPAM_CONFIRMED';
+          newThreatLevel = 'safe'; 
+          newThreatScore = 25;
+          console.log(`✅ ${mode} mode: Gemini confirmed SPAM at ${analysis.confidence}% confidence`);
+        } else {
+          geminiDecision = 'SPAM_LOW_CONFIDENCE_REJECTED';
+          newThreatLevel = 'safe';
+          newThreatScore = 10;
+          console.log(`⚠️  ${mode} mode: Spam detected but confidence too low (${analysis.confidence}%) - keeping as SAFE`);
+        }
       } else {
         geminiDecision = 'SPAM_REJECTED_AS_SAFE';
         newThreatLevel = 'safe';
@@ -854,13 +956,22 @@ or
       }
     } else if (mode === 'phishing') {
       // User suggested this might be SCAM/PHISHING - run aggressive phishing detection
-      // BUT: Only mark as danger if Gemini's analysis confirms it
-      // If Gemini says it's NOT dangerous, it stays SAFE (trust Gemini)
+      // When we find phishing, mark it as NOT spam (it's a genuine threat, not just marketing)
+      analysisDetails.isSpam = false;
+      
+      // Require minimum 75% confidence to mark as danger
       if (analysis.isDanger === true) {
-        geminiDecision = 'PHISHING_CONFIRMED';
-        newThreatLevel = 'danger';
-        newThreatScore = 95;
-        console.log(`⚠️  ${mode} mode: Gemini confirmed PHISHING/SCAM (confidence: ${analysis.confidence})`);
+        if ((analysis.confidence || 0) >= 75) {
+          geminiDecision = 'PHISHING_CONFIRMED';
+          newThreatLevel = 'danger';
+          newThreatScore = 95;
+          console.log(`⚠️  ${mode} mode: Gemini confirmed PHISHING/SCAM at ${analysis.confidence}% confidence`);
+        } else {
+          geminiDecision = 'PHISHING_LOW_CONFIDENCE_REJECTED';
+          newThreatLevel = 'safe';
+          newThreatScore = 10;
+          console.log(`⚠️  ${mode} mode: Phishing detected but confidence too low (${analysis.confidence}%) - keeping as SAFE`);
+        }
       } else {
         geminiDecision = 'PHISHING_REJECTED_AS_SAFE';
         newThreatLevel = 'safe';
@@ -928,7 +1039,157 @@ or
     });
   } catch (error) {
     console.error('Reanalysis error:', error);
-    res.status(500).json({ error: `Reanalysis failed: ${error.message}` });
+    const errorResponse = formatErrorResponse(error, 'Email reanalysis failed');
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context,
+      code: errorResponse.code
+    });
+  }
+});
+
+// Mark email as safe (update threat_level to 'safe')
+app.put('/api/threats/:id/mark-safe', async (req, res) => {
+  const { id } = req.params;
+  const userEmail = req.userEmail || req.headers['x-user-email'] || req.body?.userEmail;
+
+  if (!userEmail) {
+    return res.status(401).json({ error: 'User email required. Send via x-user-email header or userEmail in body' });
+  }
+
+  if (!id) {
+    return res.status(400).json({ error: 'Email ID required' });
+  }
+
+  try {
+    if (!pool) {
+      return res.status(503).json({ error: 'Database not available' });
+    }
+
+    const connection = await pool.getConnection();
+    
+    const query = `
+      UPDATE EmailThreats 
+      SET threat_level = 'safe', threat_score = 10, analysis_details = ?
+      WHERE id = ? AND user_email = ?
+    `;
+    
+    const analysisDetails = JSON.stringify({ userMarkedSafe: true });
+    const [result] = await connection.execute(query, [analysisDetails, id, userEmail]);
+    
+    connection.release();
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Email not found or unauthorized' });
+    }
+
+    res.json({ success: true, message: 'Email marked as safe' });
+  } catch (error) {
+    console.error('Error marking email as safe:', error);
+    const errorResponse = formatErrorResponse(error, 'Mark as safe failed');
+    res.status(errorResponse.status).json({ 
+      error: errorResponse.error,
+      context: errorResponse.context,
+      code: errorResponse.code
+    });
+  }
+});
+
+// Mark email as reviewed (set isSeen to true)
+app.put('/api/threats/:id/mark-seen', async (req, res) => {
+  const { id } = req.params;
+  const userEmail = req.userEmail || req.headers['x-user-email'] || req.body?.userEmail;
+
+  if (!userEmail) {
+    return res.status(401).json({ error: 'User email required. Send via x-user-email header or userEmail in body' });
+  }
+
+  if (!id) {
+    return res.status(400).json({ error: 'Email ID required' });
+  }
+
+  let connection;
+  try {
+    if (!pool) {
+      return res.status(503).json({ error: 'Database not available' });
+    }
+
+    connection = await pool.getConnection();
+    
+    // First, try to update the record
+    const query = `
+      UPDATE EmailThreats 
+      SET isSeen = true
+      WHERE id = ? AND user_email = ?
+    `;
+    
+    const [result] = await connection.execute(query, [id, userEmail]);
+
+    if (result.affectedRows === 0) {
+      connection.release();
+      return res.status(404).json({ error: 'Email not found or unauthorized' });
+    }
+
+    connection.release();
+    res.json({ success: true, message: 'Email marked as reviewed' });
+    
+  } catch (error) {
+    // Check if error is due to missing column
+    const errorMsg = error.message || '';
+    const isMissingColumn = errorMsg.includes('UNKNOWN_COLUMN') || 
+                           errorMsg.includes('ER_BAD_FIELD_ERROR') || 
+                           errorMsg.includes('Unknown column') ||
+                           errorMsg.includes('1054');
+    
+    if (isMissingColumn) {
+      console.log('📝 isSeen column not found, creating it...');
+      try {
+        if (!connection) {
+          connection = await pool.getConnection();
+        }
+        
+        // Create the column
+        await connection.execute(`
+          ALTER TABLE EmailThreats 
+          ADD COLUMN isSeen BOOLEAN DEFAULT false
+        `);
+        console.log('✅ isSeen column created successfully');
+        
+        // Now update the record
+        const updateQuery = `
+          UPDATE EmailThreats 
+          SET isSeen = true
+          WHERE id = ? AND user_email = ?
+        `;
+        
+        const [updateResult] = await connection.execute(updateQuery, [id, userEmail]);
+        connection.release();
+
+        if (updateResult.affectedRows === 0) {
+          return res.status(404).json({ error: 'Email not found or unauthorized' });
+        }
+
+        res.json({ success: true, message: 'Email marked as reviewed', columnCreated: true });
+      } catch (alterError) {
+        if (connection) connection.release();
+        console.error('❌ Error creating column:', alterError.message);
+        const errorResponse = formatErrorResponse(alterError, 'Failed to create/update isSeen column');
+        res.status(errorResponse.status).json({ 
+          error: errorResponse.error,
+          context: errorResponse.context,
+          code: errorResponse.code
+        });
+      }
+    } else {
+      if (connection) connection.release();
+      console.error('Error marking email as seen:', error.message);
+      const errorResponse = formatErrorResponse(error, 'Mark as seen failed');
+      res.status(errorResponse.status).json({ 
+        error: errorResponse.error,
+        context: errorResponse.context,
+        code: errorResponse.code
+      });
+    }
   }
 });
 
