@@ -384,7 +384,7 @@ app.get('/api/threats', async (req, res) => {
     // LIMIT and OFFSET must be literals in MySQL prepared statements, not parameter placeholders
     // Sort to prioritize: threats first, then spam (low-score safe emails), then other safe, then unscanned by recency
     const query = `
-      SELECT id, user_email, gmail_email_id, from_address, subject, threat_level, threat_score, reasons, analysis_details, scanned_at, created_at
+      SELECT id, user_email, gmail_email_id, from_address, subject, threat_level, threat_score, reasons, analysis_details, scanned_at, created_at, isSeen
       FROM EmailThreats
       WHERE user_email = ?
       ORDER BY 
