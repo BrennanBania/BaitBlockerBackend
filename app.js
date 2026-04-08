@@ -64,7 +64,8 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json());
+// Increase payload size limit to handle large email content
+app.use(express.json({ limit: '10mb' }));
 
 // Middleware to extract user email from Google auth
 app.use((req, res, next) => {
