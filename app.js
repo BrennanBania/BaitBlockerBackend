@@ -651,7 +651,7 @@ explanation: single sentence max 20 words why this classification`;
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 2048,
+          maxOutputTokens: 4096,
           responseMimeType: 'application/json'
         }
       })
@@ -659,12 +659,43 @@ explanation: single sentence max 20 words why this classification`;
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('Gemini API error:', errorText);
-      return res.status(500).json({ error: 'Gemini API failed: ' + errorText });
+      console.error('⚠️ Gemini API error (status ' + response.status + '):', errorText.substring(0, 200));
+      // Don't crash - return safe/unscanned instead
+      const analysis = {
+        riskLevel: 'SAFE',
+        confidence: 0,
+        isSpam: false,
+        indicators: ['API temporarily unavailable'],
+        recommendation: 'Could not analyze at this time, treating as safe',
+        explanation: 'Analysis service temporarily unavailable'
+      };
+      return res.json({ 
+        reanalysisResult: analysis,
+        geminiDecision: 'SAFE_DEFAULT_FALLBACK'
+      });
     }
 
     // Parse Gemini response
-    const data = await response.json();
+    let data;
+    try {
+      data = await response.json();
+    } catch (jsonError) {
+      console.error('⚠️ Failed to parse Gemini response as JSON:', jsonError.message);
+      // Return safe fallback if response isn't valid JSON
+      const analysis = {
+        riskLevel: 'SAFE',
+        confidence: 0,
+        isSpam: false,
+        indicators: ['Response parsing failed'],
+        recommendation: 'Could not analyze, treating as safe',
+        explanation: 'Analysis service returned invalid response'
+      };
+      return res.json({ 
+        reanalysisResult: analysis,
+        geminiDecision: 'SAFE_DEFAULT_FALLBACK'
+      });
+    }
+    
     let analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     
     // Clean up JSON if needed
@@ -816,7 +847,7 @@ or
     let finishReason = null;
     
     // Both modes need sufficient tokens - aggressive analysis produces longer responses
-    const maxTokens = mode === 'phishing' ? 2048 : 2048;
+    const maxTokens = mode === 'phishing' ? 4096 : 4096;
     
     for (let i = 0; i < contentLens.length; i++) {
       const aggressivePrompt = buildPrompt(contentLens[i]);
